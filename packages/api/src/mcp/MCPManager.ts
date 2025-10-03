@@ -13,7 +13,6 @@ import { ConnectionsRepository } from '~/mcp/ConnectionsRepository';
 import { formatToolContent } from './parsers';
 import { MCPConnection } from './connection';
 import { processMCPEnv } from '~/utils/env';
-import { CONSTANTS } from './enum';
 
 /**
  * Centralized manager for MCP server connections and tool execution.
@@ -21,8 +20,6 @@ import { CONSTANTS } from './enum';
  */
 export class MCPManager extends UserConnectionManager {
   private static instance: MCPManager | null;
-  // Connections shared by all users.
-  private appConnections: ConnectionsRepository | null = null;
 
   /** Creates and initializes the singleton MCPManager instance */
   public static async createInstance(configs: t.MCPServers): Promise<MCPManager> {
@@ -44,9 +41,25 @@ export class MCPManager extends UserConnectionManager {
     this.appConnections = new ConnectionsRepository(this.serversRegistry.appServerConfigs!);
   }
 
-  /** Returns all app-level connections */
-  public async getAllConnections(): Promise<Map<string, MCPConnection> | null> {
-    return this.appConnections!.getAll();
+  /** Retrieves an app-level or user-specific connection based on provided arguments */
+  public async getConnection(
+    args: {
+      serverName: string;
+      user?: TUser;
+      forceNew?: boolean;
+      flowManager?: FlowStateManager<MCPOAuthTokens | null>;
+    } & Omit<t.OAuthConnectionOptions, 'useOAuth' | 'user' | 'flowManager'>,
+  ): Promise<MCPConnection> {
+    if (this.appConnections!.has(args.serverName)) {
+      return this.appConnections!.get(args.serverName);
+    } else if (args.user?.id) {
+      return this.getUserConnection(args as Parameters<typeof this.getUserConnection>[0]);
+    } else {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `No connection found for server ${args.serverName}`,
+      );
+    }
   }
 
   /** Get servers that require OAuth */
@@ -54,9 +67,59 @@ export class MCPManager extends UserConnectionManager {
     return this.serversRegistry.oauthServers!;
   }
 
+  /** Get all servers */
+  public getAllServers(): t.MCPServers | null {
+    return this.serversRegistry.rawConfigs!;
+  }
+
   /** Returns all available tool functions from app-level connections */
   public getAppToolFunctions(): t.LCAvailableTools | null {
     return this.serversRegistry.toolFunctions!;
+  }
+  /** Returns all available tool functions from all connections available to user */
+  public async getAllToolFunctions(userId: string): Promise<t.LCAvailableTools | null> {
+    const allToolFunctions: t.LCAvailableTools = this.getAppToolFunctions() ?? {};
+    const userConnections = this.getUserConnections(userId);
+    if (!userConnections || userConnections.size === 0) {
+      return allToolFunctions;
+    }
+
+    for (const [serverName, connection] of userConnections.entries()) {
+      const toolFunctions = await this.serversRegistry.getToolFunctions(serverName, connection);
+      Object.assign(allToolFunctions, toolFunctions);
+    }
+
+    return allToolFunctions;
+  }
+  /** Returns all available tool functions from all connections available to user */
+  public async getServerToolFunctions(
+    userId: string,
+    serverName: string,
+  ): Promise<t.LCAvailableTools | null> {
+    try {
+      if (this.appConnections?.has(serverName)) {
+        return this.serversRegistry.getToolFunctions(
+          serverName,
+          await this.appConnections.get(serverName),
+        );
+      }
+
+      const userConnections = this.getUserConnections(userId);
+      if (!userConnections || userConnections.size === 0) {
+        return null;
+      }
+      if (!userConnections.has(serverName)) {
+        return null;
+      }
+
+      return this.serversRegistry.getToolFunctions(serverName, userConnections.get(serverName)!);
+    } catch (error) {
+      logger.warn(
+        `[getServerToolFunctions] Error getting tool functions for server ${serverName}`,
+        error,
+      );
+      return null;
+    }
   }
 
   /**
@@ -101,73 +164,6 @@ ${formattedInstructions}
 Please follow these instructions when using tools from the respective MCP servers.`;
   }
 
-  /** Loads tools from all app-level connections into the manifest. */
-  public async loadManifestTools({
-    serverToolsCallback,
-    getServerTools,
-  }: {
-    flowManager: FlowStateManager<MCPOAuthTokens | null>;
-    serverToolsCallback?: (serverName: string, tools: t.LCManifestTool[]) => Promise<void>;
-    getServerTools?: (serverName: string) => Promise<t.LCManifestTool[] | undefined>;
-  }): Promise<t.LCToolManifest> {
-    const mcpTools: t.LCManifestTool[] = [];
-    const connections = await this.appConnections!.getAll();
-    for (const [serverName, connection] of connections.entries()) {
-      try {
-        if (!(await connection.isConnected())) {
-          logger.warn(
-            `[MCP][${serverName}] Connection not available for ${serverName} manifest tools.`,
-          );
-          if (typeof getServerTools !== 'function') {
-            logger.warn(
-              `[MCP][${serverName}] No \`getServerTools\` function provided, skipping tool loading.`,
-            );
-            continue;
-          }
-          const serverTools = await getServerTools(serverName);
-          if (serverTools && serverTools.length > 0) {
-            logger.info(`[MCP][${serverName}] Loaded tools from cache for manifest`);
-            mcpTools.push(...serverTools);
-          }
-          continue;
-        }
-
-        const tools = await connection.fetchTools();
-        const serverTools: t.LCManifestTool[] = [];
-        for (const tool of tools) {
-          const pluginKey = `${tool.name}${CONSTANTS.mcp_delimiter}${serverName}`;
-
-          const config = this.serversRegistry.parsedConfigs[serverName];
-          const manifestTool: t.LCManifestTool = {
-            name: tool.name,
-            pluginKey,
-            description: tool.description ?? '',
-            icon: connection.iconPath,
-            authConfig: config?.customUserVars
-              ? Object.entries(config.customUserVars).map(([key, value]) => ({
-                  authField: key,
-                  label: value.title || key,
-                  description: value.description || '',
-                }))
-              : undefined,
-          };
-          if (config?.chatMenu === false) {
-            manifestTool.chatMenu = false;
-          }
-          mcpTools.push(manifestTool);
-          serverTools.push(manifestTool);
-        }
-        if (typeof serverToolsCallback === 'function') {
-          await serverToolsCallback(serverName, serverTools);
-        }
-      } catch (error) {
-        logger.error(`[MCP][${serverName}] Error fetching tools for manifest:`, error);
-      }
-    }
-
-    return mcpTools;
-  }
-
   /**
    * Calls a tool on an MCP server, using either a user-specific connection
    * (if userId is provided) or an app-level connection. Updates the last activity timestamp
@@ -206,30 +202,19 @@ Please follow these instructions when using tools from the respective MCP server
     const logPrefix = userId ? `[MCP][User: ${userId}][${serverName}]` : `[MCP][${serverName}]`;
 
     try {
-      if (!this.appConnections?.has(serverName) && userId && user) {
-        this.updateUserLastActivity(userId);
-        /** Get or create user-specific connection */
-        connection = await this.getUserConnection({
-          user,
-          serverName,
-          flowManager,
-          tokenMethods,
-          oauthStart,
-          oauthEnd,
-          signal: options?.signal,
-          customUserVars,
-          requestBody,
-        });
-      } else {
-        /** App-level connection */
-        connection = await this.appConnections!.get(serverName);
-        if (!connection) {
-          throw new McpError(
-            ErrorCode.InvalidRequest,
-            `${logPrefix} No app-level connection found. Cannot execute tool ${toolName}.`,
-          );
-        }
-      }
+      if (userId && user) this.updateUserLastActivity(userId);
+
+      connection = await this.getConnection({
+        serverName,
+        user,
+        flowManager,
+        tokenMethods,
+        oauthStart,
+        oauthEnd,
+        signal: options?.signal,
+        customUserVars,
+        requestBody,
+      });
 
       if (!(await connection.isConnected())) {
         /** May happen if getUserConnection failed silently or app connection dropped */
@@ -261,6 +246,7 @@ Please follow these instructions when using tools from the respective MCP server
         CallToolResultSchema,
         {
           timeout: connection.timeout,
+          resetTimeoutOnProgress: true,
           ...options,
         },
       );
